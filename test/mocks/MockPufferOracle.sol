@@ -52,7 +52,9 @@ contract MockPufferOracle is IPufferOracle {
 
     function getValidatorTicketPrice() external view returns (uint256 pricePerVT) { }
 
-    function getLockedEthAmount() external view returns (uint256 lockedEthAmount) { }
+    function getLockedEthAmount() external view returns (uint256 lockedEthAmount) {
+        return lockedETH;
+    }
 
     function isOverBurstThreshold() external view returns (bool) { }
 }
