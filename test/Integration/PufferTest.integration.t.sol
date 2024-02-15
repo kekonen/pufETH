@@ -75,6 +75,10 @@ contract PufferTest is Test {
     address dave = makeAddr("dave");
     address eve = makeAddr("eve");
 
+    // These are temporary to test functionality that requires a specific role, but these roles are not yet granted
+    address DAO = makeAddr("DAO"); // DAO is not existing yet, but here for test use
+    uint64 ROLE_ID_DAO = 77; // Should get from the proper source, not hardcode
+
     // Use Binance exchange address for mainnet fork tests to get ETH + erc20s
     address BINANCE = 0xF977814e90dA44bFA03b6295A0616a897441aceC;
     // Use Maker address for mainnet fork tests to get wETH
@@ -98,6 +102,7 @@ contract PufferTest is Test {
 
     address COMMUNITY_MULTISIG;
     address OPERATIONS_MULTISIG;
+    address PAUSER_MULTISIG;
 
     function setUp() public {
         // By forking to block 18812842, tests will start BEFORE the Lido oracle rebase
@@ -117,6 +122,7 @@ contract PufferTest is Test {
 
         COMMUNITY_MULTISIG = timelock.COMMUNITY_MULTISIG();
         OPERATIONS_MULTISIG = timelock.OPERATIONS_MULTISIG();
+        PAUSER_MULTISIG = timelock.pauserMultisig();
 
         vm.label(COMMUNITY_MULTISIG, "COMMUNITY_MULTISIG");
         vm.label(OPERATIONS_MULTISIG, "OPERATIONS_MULTISIG");
@@ -193,7 +199,7 @@ contract PufferTest is Test {
         );
     }
 
-    function _upgradeToMainnetPuffer() internal {
+    function _upgradeToMainnetPuffer() internal returns (MockPufferOracle) {
         MockPufferOracle mockOracle = new MockPufferOracle();
 
         // Simulate that our deployed oracle becomes active and starts posting results of Puffer staking
@@ -211,6 +217,26 @@ contract PufferTest is Test {
             address(newImplementation), abi.encodeCall(PufferVaultMainnet.initialize, ())
         );
         vm.stopPrank();
+
+        // I added the return for the simplicity, but would cleanup and move the mock in the setUp of the proper upgrade test file (refer to notes I will attach)
+        return mockOracle;
+    }
+
+    // This is a test to check if the PufferVault is correctly connected to the PufferOracle
+    function _test_puffer_oracle_integration(MockPufferOracle mockOracle) internal {
+        uint256 totalAssetsBefore = pufferVault.totalAssets();
+
+        // Update the Oracle with the new amount of locked ETH
+        mockOracle.proofOfReserve(
+            1000 ether,
+            block.number,
+            1,
+            new bytes[](0)
+        );
+        // Check if the PufferVault has updated the totalAssets
+        uint256 totalAssetsAfter = pufferVault.totalAssets();
+
+        assertEq(totalAssetsAfter, totalAssetsBefore + 1000 ether, "puffer oracle connection is broken");
     }
 
     function test_lido_withdrawal_dos()
@@ -365,8 +391,8 @@ contract PufferTest is Test {
 
         uint256 assetsBefore = pufferVault.totalAssets();
 
-        // Upgrade to mainnet
-        _upgradeToMainnetPuffer();
+        // Not needed for future, but I explain it in line 221
+        MockPufferOracle mockPufferOracle = _upgradeToMainnetPuffer();
 
         vm.startPrank(eve);
         SafeERC20.safeIncreaseAllowance(_WETH, address(pufferVault), type(uint256).max);
@@ -383,6 +409,90 @@ contract PufferTest is Test {
         // Real delta is 0.009900175912953700 %
         assertApproxEqRel(_WETH.balanceOf(eve), wethBeforeEve, 0.0001e18, "eve weth after withdrawal");
         assertApproxEqRel(pufferVault.totalAssets(), assetsBefore, 0.0001e18, "should have the same amount");
+
+        // Test integration with the oracle
+        _test_puffer_oracle_integration(mockPufferOracle);
+        vm.stopPrank();
+        // Test some governance
+
+        // Daily withdrawal limit
+        _test_daily_withdrawal_limit();
+        // Pauser functionality
+        _test_pauser();
+    }
+
+    // This function is needed to allow testing functionality that required some roles that are not granted and not assigned
+    modifier withGrantAccess(address target, bytes4 selector, uint64 role, address to) {
+        address deployer = makeAddr("pufferDeployer");
+
+        bytes4[] memory selectors = new bytes4[](1);
+        selectors[0] = selector;
+
+        vm.startPrank(deployer);
+
+        // Grant role to the address
+        accessManager.grantRole(role, to, 0);
+        // Grant access to the target function to the role
+        accessManager.setTargetFunctionRole(target, selectors, role);
+
+        vm.stopPrank();
+
+        _;
+    }
+
+    // Testing withdraw limits. It is a bit dirty, but a PoC + it should anyways go into separate file (read my notes attached).
+    // Due to me just using `test_upgrade_to_mainnet` as a setup it is a bit messy
+    function _test_daily_withdrawal_limit() internal
+    withGrantAccess(address(pufferVault), PufferVaultMainnet.setDailyWithdrawalLimit.selector, ROLE_ID_DAO, DAO)
+    {
+        PufferVaultMainnet pufferVaultMainnet = PufferVaultMainnet(payable(pufferVault));
+
+        uint256 assetsBefore = pufferVault.totalAssets();
+
+        vm.startPrank(eve);
+
+        // No need to allowance, since it uses `test_upgrade_to_mainnet` as a setUp for a lack of time
+
+        uint256 pufETHMinted = pufferVault.deposit(2 ether, eve);
+
+        assertEq(pufferVault.totalAssets(), assetsBefore + 2 ether, "Previous assets should increase");
+
+        vm.expectRevert();
+        pufferVault.withdraw(pufETHMinted, eve, eve);
+
+        vm.stopPrank();
+
+        vm.prank(DAO);
+        // 101 ether should be replaced with the value already witdrawn + pufETHMinted, and the rest of the test should be adjusted
+        pufferVaultMainnet.setDailyWithdrawalLimit(101 ether); 
+
+        vm.startPrank(eve);
+
+        uint256 restAllowed = pufferVaultMainnet.getRemainingAssetsDailyWithdrawalLimit();
+
+        // Rest allowed is a bit higher than 1 ether because of less than 100 was redeemed in the test before
+        assertApproxEqRel(restAllowed, 1 ether, 0.01e18, "Allowed is a bit higher than 1 eth");
+
+        // this 1 ether could be adjusted according to math
+        pufferVault.withdraw(restAllowed, eve, eve);
+        vm.stopPrank();
+    }
+
+    // Simple test for pauser functionality, ofc it should also test the withdraw and deposit, but I am running out of time
+    function _test_pauser() public
+    {
+        address[] memory pauseTargets = new address[](1);
+        pauseTargets[0] = address(pufferVault);
+
+        vm.prank(PAUSER_MULTISIG);
+        timelock.pause(pauseTargets);
+
+        // While this test is called from test_upgrade_to_mainnet, we assume eve already has some weth allowance
+        vm.startPrank(eve);
+
+        // We have paused the contract, so this should revert
+        vm.expectRevert();
+        pufferVault.deposit(100 ether, eve);
     }
 
     function test_minting_and_lido_rebasing()
